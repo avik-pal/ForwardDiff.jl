@@ -10,8 +10,6 @@ PartialsFn{T}(dual::Dual) where {T} = PartialsFn{T,typeof(dual)}(dual)
 
 (f::PartialsFn{T})(i) where {T} = partials(T, f.dual, i)
 
-_take(itr, N::Integer) = Iterators.take(itr, min(length(itr), N))
-
 function ForwardDiff.seed!(duals::AbstractGPUArray{Dual{T,V,N}}, x,
                            seed::Partials{N,V}) where {T,V,N}
     idxs = collect(ForwardDiff.structural_eachindex(duals, x))
@@ -21,7 +19,7 @@ end
 
 function ForwardDiff.seed!(duals::AbstractGPUArray{Dual{T,V,N}}, x,
                            seeds::NTuple{N,Partials{N,V}}) where {T,V,N}
-    idxs = collect(_take(ForwardDiff.structural_eachindex(duals, x), N))
+    idxs = collect(Iterators.take(ForwardDiff.structural_eachindex(duals, x), N))
     duals[idxs] .= Dual{T,V,N}.(view(x, idxs), getindex.(Ref(seeds), 1:length(idxs)))
     return duals
 end
@@ -38,7 +36,7 @@ function ForwardDiff.seed!(duals::AbstractGPUArray{Dual{T,V,N}}, x, index,
                            seeds::NTuple{N,Partials{N,V}}, chunksize) where {T,V,N}
     offset = index - 1
     idxs = collect(
-        _take(Iterators.drop(ForwardDiff.structural_eachindex(duals, x), offset), chunksize)
+        Iterators.take(Iterators.drop(ForwardDiff.structural_eachindex(duals, x), offset), chunksize)
     )
     duals[idxs] .= Dual{T,V,N}.(view(x, idxs), getindex.(Ref(seeds), 1:length(idxs)))
     return duals
@@ -48,7 +46,7 @@ end
 function ForwardDiff.extract_gradient!(::Type{T}, result::AbstractGPUArray,
                                        dual::Dual) where {T}
     fn = PartialsFn{T}(dual)
-    idxs = collect(_take(ForwardDiff.structural_eachindex(result), npartials(dual)))
+    idxs = collect(Iterators.take(ForwardDiff.structural_eachindex(result), npartials(dual)))
     result[idxs] .= fn.(1:length(idxs))
     return result
 end
@@ -58,7 +56,7 @@ function ForwardDiff.extract_gradient_chunk!(::Type{T}, result::AbstractGPUArray
     fn = PartialsFn{T}(dual)
     offset = index - 1
     idxs = collect(
-        _take(Iterators.drop(ForwardDiff.structural_eachindex(result), offset), chunksize)
+        Iterators.take(Iterators.drop(ForwardDiff.structural_eachindex(result), offset), chunksize)
     )
     result[idxs] .= fn.(1:length(idxs))
     return result
