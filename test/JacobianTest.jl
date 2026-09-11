@@ -243,22 +243,98 @@ end
 end
 
 @testset "eigen" begin
-    @test ForwardDiff.jacobian(x -> eigvals(SymTridiagonal(x, x[1:end-1])), [1.,2.]) ≈ [(1 - 3/sqrt(5))/2 (1 - 1/sqrt(5))/2 ; (1 + 3/sqrt(5))/2 (1 + 1/sqrt(5))/2]
-    @test ForwardDiff.jacobian(x -> eigvals(Symmetric(x*x')), [1.,2.]) ≈ [0 0; 2 4]
+    eigvals_symreal(x) = eigvals(Symmetric(x*x'))
+    eigvals_hermreal(x) = eigvals(Hermitian(x*x'))
+    eigvals_hermcomplex(x) = map(abs2, eigvals(Hermitian(complex.(x*x', x'*x))))
+    eigvals_symtridiag(x) = eigvals(SymTridiagonal(x, x[begin:(end - 1)]))
 
-    x0 = [1.0, 2.0];
-    ev1(x) = eigen(Symmetric(x*x')).vectors[:,1]
-    @test ForwardDiff.jacobian(ev1, x0) ≈ Calculus.finite_difference_jacobian(ev1, x0)
-    ev2(x) = eigen(SymTridiagonal(x, x[1:end-1])).vectors[:,1]
-    @test ForwardDiff.jacobian(ev2, x0) ≈ Calculus.finite_difference_jacobian(ev2, x0)
+    eigen_vals_symreal(x) = eigen(Symmetric(x*x')).values
+    eigen_vals_hermreal(x) = eigen(Hermitian(x*x')).values
+    eigen_vals_hermcomplex(x) = map(abs2, eigen(Hermitian(complex.(x*x', x'*x))).values)
+    eigen_vals_symtridiag(x) = eigen(SymTridiagonal(x, x[begin:(end - 1)])).values
 
-    x0_svector = SVector{2}(x0)
-    @test ForwardDiff.jacobian(ev1, x0_svector) isa SMatrix{2, 2}
-    @test ForwardDiff.jacobian(ev1, x0_svector) ≈ Calculus.finite_difference_jacobian(ev1, x0)
+    eigen_vec1_symreal(x) = eigen(Symmetric(x*x')).vectors[:,1]
+    eigen_vec1_hermreal(x) = eigen(Hermitian(x*x')).vectors[:,1]
+    eigen_vec1_hermcomplex(x) = map(abs2, eigen(Hermitian(complex.(x*x', x'*x))).vectors[:,1])
+    eigen_vec1_symtridiag(x) = eigen(SymTridiagonal(x, x[begin:(end - 1)])).vectors[:,1]
+    
+    # Note: SymTridiagonal is not supported for StaticArrays
+    x0 = [1.0, 2.0]
+    for T in (Int, Float32, Float64), A in (Array, SArray, MArray)
+        if A <: StaticArrays.StaticArray
+            x = A{Tuple{2},T}(x0)
+            JT = A{Tuple{2,2},float(T)}
+        else
+            x = A{T,1}(x0)
+            JT = A{float(T),2}
+        end
 
-    x0_mvector = MVector{2}(x0)
-    @test ForwardDiff.jacobian(ev1, x0_mvector) isa MMatrix{2, 2}
-    @test ForwardDiff.jacobian(ev1, x0_mvector) ≈ Calculus.finite_difference_jacobian(ev1, x0)
+        # analytic solutions
+        @test ForwardDiff.jacobian(eigvals_symreal, x) ≈ [0 0; 2 4]
+        @test ForwardDiff.jacobian(eigvals_hermreal, x) ≈ [0 0; 2 4]
+        if !(x isa StaticArrays.StaticArray)
+           @test ForwardDiff.jacobian(eigvals_symtridiag, x) ≈ [(1 - 3/sqrt(5))/2 (1 - 1/sqrt(5))/2 ; (1 + 3/sqrt(5))/2 (1 + 1/sqrt(5))/2]
+        end
+
+        # eigen + eigvals
+        for ev in (
+            eigvals_symreal, eigvals_hermreal, eigvals_hermcomplex, eigvals_symtridiag,
+            eigen_vals_symreal, eigen_vals_hermreal, eigen_vals_hermcomplex, eigen_vals_symtridiag,            
+            eigen_vec1_symreal, eigen_vec1_hermreal, eigen_vec1_hermcomplex, eigen_vec1_symtridiag,
+        )
+            if x isa StaticArrays.StaticArray &&
+                (ev === eigvals_symtridiag || ev === eigen_vals_symtridiag || ev === eigen_vec1_symtridiag)
+                continue
+            end
+
+            # Chunk size can only be inferred for static arrays
+            if x isa StaticArrays.StaticArray
+                @test @inferred(ForwardDiff.jacobian(ev, x)) isa JT
+            else
+                @test ForwardDiff.jacobian(ev, x) isa JT
+            end
+            cfg = ForwardDiff.JacobianConfig(ev, x)
+            @test @inferred(ForwardDiff.jacobian(ev, x, cfg)) isa JT
+
+            @test ForwardDiff.jacobian(ev, x) ≈ Calculus.finite_difference_jacobian(ev, float.(x0))
+        end
+
+        # consistency of eigen and eigvals
+        for (eigvals, eigen_vals) in (
+            (eigvals_symreal, eigen_vals_symreal),
+            (eigvals_hermreal, eigen_vals_hermreal),
+            (eigvals_hermcomplex, eigen_vals_hermcomplex),
+            (eigvals_symtridiag, eigen_vals_symtridiag),
+        )
+            if x isa StaticArrays.StaticArray && eigvals === eigvals_symtridiag
+                continue
+            end
+            @test ForwardDiff.jacobian(eigvals, x) ≈ ForwardDiff.jacobian(eigen_vals, x)
+        end
+    end
+
+    # The matrices above are all of the form `x*x'` and hence symmetric, so `:U` and `:L` wrap the
+    # same matrix. Here the raw storage is deliberately not symmetric/Hermitian: the values and the
+    # partials both have to be read from the triangle that `uplo` selects.
+    @testset "uplo = :$uplo" for uplo in (:U, :L)
+        # `2*x[1]+x[2]^2` rather than something proportional to the off-diagonal entry, so that the
+        # eigenvector direction actually depends on `x` and the eigenvector test is not vacuous
+        raw_real(x) = [x[1] x[2]; 3*x[2] 2*x[1]+x[2]^2]
+        raw_complex(x) = complex.(raw_real(x), [0 x[1]; -2*x[2] 0])
+        x0 = [1.0, 2.0]
+
+        @testset "$name" for (name, wrap) in (
+            ("Symmetric{<:Real}", x -> Symmetric(raw_real(x), uplo)),
+            ("Hermitian{<:Real}", x -> Hermitian(raw_real(x), uplo)),
+            ("Hermitian{<:Complex}", x -> Hermitian(raw_complex(x), uplo)),
+        )
+            for ev in (x -> eigvals(wrap(x)),
+                       x -> eigen(wrap(x)).values,
+                       x -> map(abs2, eigen(wrap(x)).vectors[:, 1]))
+                @test ForwardDiff.jacobian(ev, x0) ≈ Calculus.finite_difference_jacobian(ev, x0)
+            end
+        end
+    end
 end
 
 @testset "type stability" begin
@@ -298,18 +374,27 @@ end
         @test res == I
     end
 
-    # Unassigned (but unused) entry in the input and unassigned entries in the output
-    resize!(x, 10)
-    f = (y, x) -> copyto!(y, 1, x, 1, 9)
-    for chunksize in (1, 2, 10)
-        y = similar(x, 9)
-        @test all(i -> !isassigned(y, i), eachindex(y))
-        cfg = ForwardDiff.JacobianConfig(f, y, x, ForwardDiff.Chunk{chunksize}())
-        res = ForwardDiff.jacobian(f, y, x, cfg)
-        @test y == x[1:(end-1)]
-        @test res isa Matrix{BigFloat}
-        @test res[:, 1:(end-1)] == I
-        @test all(iszero, res[:, end])
+    # Unassigned (but unused) entry in the input and unassigned entries in the output. `hole` is
+    # varied so the unassigned entry lands in a middle chunk as well as in the last one: only the
+    # former reaches the `Base._unsetindex!` branch of the windowed seeding path, since the last
+    # chunk is never cleared.
+    @testset "unassigned input entry at $hole" for hole in (5, 10)
+        x = Vector{BigFloat}(undef, 10)
+        for i in eachindex(x)
+            i == hole || (x[i] = BigFloat(i))
+        end
+        used = [i for i in eachindex(x) if i != hole]
+        f = (y, x) -> (for (k, i) in enumerate(used); y[k] = x[i]; end; y)
+        for chunksize in (1, 2, 10)
+            y = similar(x, 9)
+            @test all(i -> !isassigned(y, i), eachindex(y))
+            cfg = ForwardDiff.JacobianConfig(f, y, x, ForwardDiff.Chunk{chunksize}())
+            res = ForwardDiff.jacobian(f, y, x, cfg)
+            @test y == x[used]
+            @test res isa Matrix{BigFloat}
+            @test res[:, used] == I
+            @test all(iszero, res[:, hole])
+        end
     end
 end
 

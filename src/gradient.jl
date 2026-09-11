@@ -113,7 +113,9 @@ end
 
 function chunk_mode_gradient_expr(result_definition::Expr)
     return quote
-        @assert structural_length(x) >= N "chunk size cannot be greater than ForwardDiff.structural_length(x) ($(N) > $(structural_length(x)))"
+        if structural_length(x) < N
+            throw(ArgumentError(lazy"chunk size cannot be greater than ForwardDiff.structural_length(x) ($(N) > $(structural_length(x)))"))
+        end
 
         # precalculate loop bounds
         xlen = structural_length(x)
@@ -125,14 +127,15 @@ function chunk_mode_gradient_expr(result_definition::Expr)
         # seed work vectors
         xdual = cfg.duals
         seeds = cfg.seeds
-        seed!(xdual, x)
 
-        # do first chunk manually to calculate output type
+        # do first chunk manually to calculate output type. Seeding the first chunk and zeroing the
+        # remaining elements partitions `xdual`, so every element is initialized exactly once.
         seed!(xdual, x, 1, seeds)
+        seed_zero_partials!(xdual, x, N + 1, xlen - N)
         ydual = f(xdual)
         $(result_definition)
         extract_gradient_chunk!(T, result, ydual, 1, N)
-        seed!(xdual, x, 1)
+        seed_zero_partials!(xdual, x, 1)
 
         # do middle chunks
         for c in middlechunks
@@ -140,7 +143,7 @@ function chunk_mode_gradient_expr(result_definition::Expr)
             seed!(xdual, x, i, seeds)
             ydual = f(xdual)
             extract_gradient_chunk!(T, result, ydual, i, N)
-            seed!(xdual, x, i)
+            seed_zero_partials!(xdual, x, i)
         end
 
         # do final chunk

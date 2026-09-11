@@ -35,11 +35,10 @@ struct DualMismatchError{A,B} <: Exception
 end
 
 Base.showerror(io::IO, e::DualMismatchError{A,B}) where {A,B} =
-    print(io, "Cannot determine ordering of Dual tags $(e.a) and $(e.b)")
+    print(io, "Cannot determine ordering of Dual tags ", e.a, " and ", e.b)
 
 @noinline function throw_cannot_dual(V::Type)
-    throw(ArgumentError("Cannot create a dual over scalar type $V." *
-        " If the type behaves as a scalar, define ForwardDiff.can_dual(::Type{$V}) = true."))
+    throw(ArgumentError(lazy"Cannot create a dual over scalar type $V. If the type behaves as a scalar, define ForwardDiff.can_dual(::Type{$V}) = true."))
 end
 
 """
@@ -211,13 +210,13 @@ macro define_ternary_dual_op(f, xyz_body, xy_body, xz_body, yz_body, x_body, y_b
 end
 
 # Support complex-valued functions such as `hankelh1`
-function dual_definition_retval(::Val{T}, val::Real, deriv::Real, partial::Partials) where {T}
+@inline function dual_definition_retval(::Val{T}, val::Real, deriv::Real, partial::Partials) where {T}
     return Dual{T}(val, deriv * partial)
 end
-function dual_definition_retval(::Val{T}, val::Real, deriv1::Real, partial1::Partials, deriv2::Real, partial2::Partials) where {T}
+@inline function dual_definition_retval(::Val{T}, val::Real, deriv1::Real, partial1::Partials, deriv2::Real, partial2::Partials) where {T}
     return Dual{T}(val, _mul_partials(partial1, partial2, deriv1, deriv2))
 end
-function dual_definition_retval(::Val{T}, val::Complex, deriv::Union{Real,Complex}, partial::Partials) where {T}
+@inline function dual_definition_retval(::Val{T}, val::Complex, deriv::Union{Real,Complex}, partial::Partials) where {T}
     reval, imval = reim(val)
     if deriv isa Real
         p = deriv * partial
@@ -227,7 +226,7 @@ function dual_definition_retval(::Val{T}, val::Complex, deriv::Union{Real,Comple
         return Complex(Dual{T}(reval, rederiv * partial), Dual{T}(imval, imderiv * partial))
     end
 end
-function dual_definition_retval(::Val{T}, val::Complex, deriv1::Union{Real,Complex}, partial1::Partials, deriv2::Union{Real,Complex}, partial2::Partials) where {T}
+@inline function dual_definition_retval(::Val{T}, val::Complex, deriv1::Union{Real,Complex}, partial1::Partials, deriv2::Union{Real,Complex}, partial2::Partials) where {T}
     reval, imval = reim(val)
     if deriv1 isa Real && deriv2 isa Real
         p = _mul_partials(partial1, partial2, deriv1, deriv2)
@@ -326,17 +325,18 @@ end
 
 Base.rtoldefault(::Type{D}) where {D<:Dual} = Base.rtoldefault(valtype(D))
 
-Base.floor(::Type{R}, d::Dual) where {R<:Real} = floor(R, value(d))
-Base.floor(d::Dual) = floor(value(d))
+# Base derives floor/ceil/trunc/round from `round(x, ::RoundingMode)`:
+# https://docs.julialang.org/en/v1/manual/interfaces/#man-rounding-interface
+Base.round(d::Dual, r::RoundingMode) = round(value(d), r)
 
-Base.ceil(::Type{R}, d::Dual) where {R<:Real} = ceil(R, value(d))
-Base.ceil(d::Dual) = ceil(value(d))
-
-Base.trunc(::Type{R}, d::Dual) where {R<:Real} = trunc(R, value(d))
-Base.trunc(d::Dual) = trunc(value(d))
-
-Base.round(::Type{R}, d::Dual) where {R<:Real} = round(R, value(d))
-Base.round(d::Dual) = round(value(d))
+# Julia 1.11 added the generic `f(::Type{T}, x)` fallbacks, so these can be
+# dropped once 1.11 is the minimum supported version.
+if VERSION < v"1.11"
+    Base.floor(::Type{R}, d::Dual) where {R<:Real} = floor(R, value(d))
+    Base.ceil(::Type{R}, d::Dual) where {R<:Real} = ceil(R, value(d))
+    Base.trunc(::Type{R}, d::Dual) where {R<:Real} = trunc(R, value(d))
+    Base.round(::Type{R}, d::Dual) where {R<:Real} = round(R, value(d))
+end
 
 Base.fld(x::Dual, y::Dual) = fld(value(x), value(y))
 
@@ -392,7 +392,7 @@ for pred in UNARY_PREDICATES
 end
 
 # Before PR#481 this loop ran over this list:
-# BINARY_PREDICATES = Symbol[:isequal, :isless, :<, :>, :(==), :(!=), :(<=), :(>=)]
+# BINARY_PREDICATES = Symbol[:isequal, :isless, :<, :>, :(==), :(<=), :(>=)]
 # Not a minimal set, as Base defines some in terms of others.
 @define_binary_dual_op(
     Base.:(<),
@@ -426,13 +426,6 @@ for pred in [:isequal, :(==)]
         )
     end
 end
-
-@define_binary_dual_op(
-    Base.:(!=),
-    (!=)(value(x), value(y)) || (!=)(partials(x), partials(y)),
-    (!=)(value(x), y)        || !iszero(partials(x)),
-    (!=)(x, value(y))        || !iszero(partials(y)),
-)
 
 ########################
 # Promotion/Conversion #
@@ -584,7 +577,7 @@ for (f, log) in ((:(Base.:^), :(Base.log)), (:(NaNMath.pow), :(NaNMath.log)))
             begin
                 v = value(y)
                 expv = ($f)(x, v)
-                deriv = (iszero(x) && v > 0) ? zero(expv) : expv*($log)(x)
+                deriv = (iszero(x) && v > 0) ? zero(expv) : expv*($log)(oftype(expv, x))
                 return Dual{Ty}(expv, deriv * partials(y))
             end
         )
@@ -736,68 +729,139 @@ end
     return (Dual{T}(sd, cd * π * partials(d)), Dual{T}(cd, -sd * π * partials(d)))
 end
 
-# Symmetric eigvals #
-#-------------------#
+# LinearAlgebra.givensAlgorithm #
+#-------------------------------#
 
-# To be able to reuse this default definition in the StaticArrays extension
-# (has to be re-defined to avoid method ambiguity issues)
-# we forward the call to an internal method that can be shared and reused
-LinearAlgebra.eigvals(A::Symmetric{<:Dual{Tg,T,N}}) where {Tg,T<:Real,N} = _eigvals(A)
-function _eigvals(A::Symmetric{<:Dual{Tg,T,N}}) where {Tg,T<:Real,N}
-    λ,Q = eigen(Symmetric(value.(parent(A))))
-    parts = ntuple(j -> diag(Q' * getindex.(partials.(A), j) * Q), N)
-    Dual{Tg}.(λ, tuple.(parts...))
+# This definition ensures that we match `LinearAlgebra.givensAlgorithm`
+# for non-dual numbers (i.e., `ForwardDiff.Dual` with zero partials)
+# `LinearAlgebra.givensAlgorithm` is derived from LAPACK's dlartg
+# which is [documented](https://netlib.org/lapack/explore-html/da/dd3/group__lartg_ga86f8f877eaea0386cdc2c3c175d9ea88.html) to return
+# three values c, s, u for two arguments x and y with
+# u = sgn(x) sqrt(x^2 + y^2)
+# c = x/u
+# s = y/u
+# The function is discontinuous in u at x=0
+@define_binary_dual_op(
+    LinearAlgebra.givensAlgorithm,
+    begin
+        vx, vy = value(x), value(y)
+        c, s, u = LinearAlgebra.givensAlgorithm(vx, vy)
+        ∂c∂x = s^2 / u
+        ∂c∂y = ∂s∂x = -(c * s / u)
+        ∂s∂y = c^2 / u
+        ∂x = partials(x)
+        ∂y = partials(y)
+        ∂c = _mul_partials(∂x, ∂y, ∂c∂x, ∂c∂y)
+        ∂s = _mul_partials(∂x, ∂y, ∂s∂x, ∂s∂y)
+        ∂u = _mul_partials(∂x, ∂y, c, s)
+        return Dual{Txy}(c, ∂c), Dual{Txy}(s, ∂s), Dual{Txy}(u, ∂u)
+    end,
+    begin
+        vx = value(x)
+        c, s, u = LinearAlgebra.givensAlgorithm(vx, y)
+        ∂c∂x = s^2 / u
+        ∂s∂x = -(c * s / u)
+        ∂x = partials(x)
+        ∂c = ∂c∂x * ∂x
+        ∂s = ∂s∂x * ∂x
+        ∂u = c * ∂x
+        return Dual{Tx}(c, ∂c), Dual{Tx}(s, ∂s), Dual{Tx}(u, ∂u)
+    end,
+    begin
+        vy = value(y)
+        c, s, u = LinearAlgebra.givensAlgorithm(x, vy)
+        ∂c∂y = -(c * s / u)
+        ∂s∂y = c^2 / u
+        ∂y = partials(y)
+        ∂c = ∂c∂y * ∂y
+        ∂s = ∂s∂y * ∂y
+        ∂u = s * ∂y
+        return Dual{Ty}(c, ∂c), Dual{Ty}(s, ∂s), Dual{Ty}(u, ∂u)
+    end,
+)
+
+# eigen values and vectors of Hermitian matrices #
+#------------------------------------------------#
+
+# Extract structured matrices of primal values and partials
+_structured_value(A::Symmetric{Dual{T,V,N}}) where {T,V,N} = Symmetric(map(value, parent(A)), A.uplo === 'U' ? :U : :L)
+_structured_value(A::Hermitian{Dual{T,V,N}}) where {T,V,N} = Hermitian(map(value, parent(A)), A.uplo === 'U' ? :U : :L)
+_structured_value(A::Hermitian{Complex{Dual{T,V,N}}}) where {T,V,N} = Hermitian(map(z -> splat(complex)(map(value, reim(z))), parent(A)), A.uplo === 'U' ? :U : :L)
+_structured_value(A::SymTridiagonal{Dual{T,V,N}}) where {T,V,N} = SymTridiagonal(map(value, A.dv), map(value, A.ev))
+
+_structured_partials(A::Symmetric{Dual{T,V,N}}, j::Int) where {T,V,N} = Symmetric(partials.(parent(A), j), A.uplo === 'U' ? :U : :L)
+_structured_partials(A::Hermitian{Dual{T,V,N}}, j::Int) where {T,V,N} = Hermitian(partials.(parent(A), j), A.uplo === 'U' ? :U : :L)
+function _structured_partials(A::Hermitian{Complex{Dual{T,V,N}}}, j::Int) where {T,V,N}
+    return Hermitian(complex.(partials.(real.(parent(A)), j), partials.(imag.(parent(A)), j)), A.uplo === 'U' ? :U : :L)
+end
+_structured_partials(A::SymTridiagonal{Dual{T,V,N}}, j::Int) where {T,V,N} = SymTridiagonal(partials.(A.dv, j), partials.(A.ev, j))
+
+# Convert arrays of primal values and partials to arrays of Duals
+function _to_duals(::Val{T}, values::AbstractArray{<:Real}, partials::Tuple{Vararg{AbstractArray{<:Real}}}) where {T}
+    return Dual{T}.(values, tuple.(partials...))
+end
+function _to_duals(::Val{T}, values::AbstractArray{<:Complex}, partials::Tuple{Vararg{AbstractArray{<:Complex}}}) where {T}
+    return complex.(
+        Dual{T}.(real.(values), Base.Fix1(map, real).(tuple.(partials...))),
+        Dual{T}.(imag.(values), Base.Fix1(map, imag).(tuple.(partials...))),
+    )
 end
 
-function LinearAlgebra.eigvals(A::Hermitian{<:Complex{<:Dual{Tg,T,N}}}) where {Tg,T<:Real,N}
-    λ,Q = eigen(Hermitian(value.(real.(parent(A))) .+ im .* value.(imag.(parent(A)))))
-    parts = ntuple(j -> diag(real.(Q' * (getindex.(partials.(real.(A)) .+ im .* partials.(imag.(A)), j)) * Q)), N)
-    Dual{Tg}.(λ, tuple.(parts...))
+# We forward the call to an internal method that can be shared and reused
+LinearAlgebra.eigvals(A::Symmetric{Dual{T,V,N}}) where {T,V<:Real,N} = _eigvals_hermitian(A)
+LinearAlgebra.eigvals(A::Hermitian{Dual{T,V,N}}) where {T,V<:Real,N} = _eigvals_hermitian(A)
+LinearAlgebra.eigvals(A::Hermitian{Complex{Dual{T,V,N}}}) where {T,V<:Real,N} = _eigvals_hermitian(A)
+LinearAlgebra.eigvals(A::SymTridiagonal{Dual{T,V,N}}) where {T,V<:Real,N} = _eigvals_hermitian(A)
+
+# Eigenvalues of Hermitian-structured matrices
+const DualMatrixRealComplex{T,V<:Real,N} = Union{AbstractMatrix{Dual{T,V,N}}, AbstractMatrix{Complex{Dual{T,V,N}}}}
+function _eigvals_hermitian(A::DualMatrixRealComplex{T,<:Real,N}) where {T,N}
+    F = eigen(_structured_value(A))
+    λ = F.values
+    Q = F.vectors
+    parts = ntuple(j -> real(diag(Q' * (_structured_partials(A, j) * Q))), N)
+    return _to_duals(Val(T), λ, parts)
 end
 
-function LinearAlgebra.eigvals(A::SymTridiagonal{<:Dual{Tg,T,N}}) where {Tg,T<:Real,N}
-    λ,Q = eigen(SymTridiagonal(value.(parent(A).dv),value.(parent(A).ev)))
-    parts = ntuple(j -> diag(Q' * getindex.(partials.(A), j) * Q), N)
-    Dual{Tg}.(λ, tuple.(parts...))
-end
-
-# A ./ (λ' .- λ) but with diag special cased
+# A ./ (λ' .- λ) but with diagonal elements zeroed out
 # Default out-of-place method
-function _lyap_div!!(A::AbstractMatrix, λ::AbstractVector)
+function _lyap_div_zero_diag!!(A::AbstractMatrix, λ::AbstractVector)
     return map(
-        (a, b, idx) -> a / (idx[1] == idx[2] ? oneunit(b) : b),
+        (a, b, idx) -> idx[1] == idx[2] ? zero(a) / oneunit(b) : a / b,
         A,
         λ' .- λ,
         CartesianIndices(A),
     )
 end
 # For `Matrix` (and e.g. `StaticArrays.MMatrix`) we can use an in-place method
-_lyap_div!!(A::Matrix, λ::AbstractVector) = _lyap_div!(A, λ)
-function _lyap_div!(A::AbstractMatrix, λ::AbstractVector)
+_lyap_div_zero_diag!!(A::Matrix, λ::AbstractVector) = _lyap_div_zero_diag!(A, λ)
+function _lyap_div_zero_diag!(A::AbstractMatrix, λ::AbstractVector)
     for (j,μ) in enumerate(λ), (k,λ) in enumerate(λ)
-        if k ≠ j
+        if k == j
+            A[k, j] = zero(A[k, j])
+        else
             A[k,j] /= μ - λ
         end
     end
     A
 end
 
-# To be able to reuse this default definition in the StaticArrays extension
-# (has to be re-defined to avoid method ambiguity issues)
-# we forward the call to an internal method that can be shared and reused
-LinearAlgebra.eigen(A::Symmetric{<:Dual{Tg,T,N}}) where {Tg,T<:Real,N} = _eigen(A)
-function _eigen(A::Symmetric{<:Dual{Tg,T,N}}) where {Tg,T<:Real,N}
-    λ = eigvals(A)
-    _,Q = eigen(Symmetric(value.(parent(A))))
-    parts = ntuple(j -> Q*_lyap_div!!(Q' * getindex.(partials.(A), j) * Q - Diagonal(getindex.(partials.(λ), j)), value.(λ)), N)
-    Eigen(λ,Dual{Tg}.(Q, tuple.(parts...)))
-end
+# We forward the call to an internal method that can be shared and reused
+LinearAlgebra.eigen(A::Symmetric{Dual{T,V,N}}) where {T,V<:Real,N} = _eigen_hermitian(A)
+LinearAlgebra.eigen(A::Hermitian{Dual{T,V,N}}) where {T,V<:Real,N} = _eigen_hermitian(A)
+LinearAlgebra.eigen(A::Hermitian{Complex{Dual{T,V,N}}}) where {T,V<:Real,N} = _eigen_hermitian(A)
+LinearAlgebra.eigen(A::SymTridiagonal{Dual{T,V,N}}) where {T,V<:Real,N} = _eigen_hermitian(A)
 
-function LinearAlgebra.eigen(A::SymTridiagonal{<:Dual{Tg,T,N}}) where {Tg,T<:Real,N}
-    λ = eigvals(A)
-    _,Q = eigen(SymTridiagonal(value.(parent(A))))
-    parts = ntuple(j -> Q*_lyap_div!!(Q' * getindex.(partials.(A), j) * Q - Diagonal(getindex.(partials.(λ), j)), value.(λ)), N)
-    Eigen(λ,Dual{Tg}.(Q, tuple.(parts...)))
+function _eigen_hermitian(A::DualMatrixRealComplex{T,<:Real,N}) where {T,N}
+    F = eigen(_structured_value(A))
+    λ = F.values
+    Q = F.vectors
+    # `Q' * (∂A * Q)`, not `(Q' * ∂A) * Q`: the latter hits `Adjoint * Symmetric`, which has no BLAS
+    # specialization and so allocates an extra temporary and skips `symm`/`hemm`
+    Qt_∂A_Q = ntuple(j -> Q' * (_structured_partials(A, j) * Q), N)
+    λ_partials = map(real ∘ diag, Qt_∂A_Q)
+    Q_partials = map(Qt_∂Aj_Q -> Q*_lyap_div_zero_diag!!(Qt_∂Aj_Q, λ), Qt_∂A_Q)
+    return Eigen(_to_duals(Val(T), λ, λ_partials), _to_duals(Val(T), Q, Q_partials))
 end
 
 # Functions in SpecialFunctions which return tuples #
